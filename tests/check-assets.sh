@@ -9,5 +9,8 @@ grep -q 'ALEXANDRIE_ASSET_BASE_URL="\$REPO_RAW_URL"' "$ROOT_DIR/ct/alexandrie.sh
 grep -Fq -- '--rootfs "$STORAGE:$DISK"' "$ROOT_DIR/ct/alexandrie.sh"
 ! grep -Fq -- '--rootfs "$STORAGE:${DISK}G"' "$ROOT_DIR/ct/alexandrie.sh"
 ! grep -Fq -- '--rootfs %s:%sG' "$ROOT_DIR/ct/alexandrie.sh"
+start_line=$(grep -n -F 'pct start "$CTID"' "$ROOT_DIR/ct/alexandrie.sh" | cut -d: -f1)
+push_line=$(grep -n -F 'pct push "$CTID"' "$ROOT_DIR/ct/alexandrie.sh" | cut -d: -f1)
+(( start_line < push_line ))
 grep -q 'ALEXANDRIE_ASSET_BASE_URL' "$ROOT_DIR/install/alexandrie-install.sh"
 printf 'Release-Assets: erfolgreich geprüft.\n'
