@@ -357,7 +357,7 @@ create_container() {
     net0=$(build_net0)
     if [[ $DRY_RUN == 1 ]]; then
         log_info 'Dry-Run: kein LXC wird erstellt.'
-        printf 'pct create %s %s --hostname %s --cores %s --memory %s --swap %s --rootfs %s:%sG --net0 %s\n' \
+        printf 'pct create %s %s --hostname %s --cores %s --memory %s --swap %s --rootfs %s:%s --net0 %s\n' \
             "$CTID" "$TEMPLATE" "$HOSTNAME" "$CORES" "$MEMORY" "$SWAP" "$STORAGE" "$DISK" "$net0"
         return 0
     fi
@@ -371,7 +371,7 @@ create_container() {
         --cores "$CORES" \
         --memory "$MEMORY" \
         --swap "$SWAP" \
-        --rootfs "$STORAGE:${DISK}G" \
+        --rootfs "$STORAGE:$DISK" \
         --net0 "$net0" \
         --onboot "$ONBOOT" \
         --tags "$TAGS" \
