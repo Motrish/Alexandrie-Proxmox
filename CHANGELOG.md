@@ -15,3 +15,4 @@
 ### Fixed
 
 - Proxmox-Rootfs-Größe ohne `G`-Suffix an `pct create` übergeben; Directory- und LVM-Thin-Storages akzeptieren hier die Form `storage:size`.
+- Installer-Datei erst nach dem Start und erfolgreichen Bereitschaftscheck per `pct push` in den LXC übertragen.
