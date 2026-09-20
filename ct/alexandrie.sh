@@ -330,20 +330,24 @@ prepare_defaults() {
 }
 
 install_container() {
-    local net0 installer_url
-    net0=$(build_net0)
+    local installer_url ready
     installer_url="$REPO_RAW_URL/install/alexandrie-install.sh"
     INSTALLER_TMP=$(mktemp)
     log_info "Lade Installer aus dem Release: $installer_url"
     curl --fail --silent --show-error --location --connect-timeout 15 --max-time 120 \
         "$installer_url" -o "$INSTALLER_TMP"
     chmod 700 "$INSTALLER_TMP"
-    pct push "$CTID" "$INSTALLER_TMP" /root/alexandrie-install.sh --perms 0700
     pct start "$CTID"
+    ready='0'
     for _ in $(seq 1 30); do
-        pct exec "$CTID" -- true >/dev/null 2>&1 && break
+        if pct exec "$CTID" -- true >/dev/null 2>&1; then
+            ready='1'
+            break
+        fi
         sleep 2
     done
+    [[ $ready == 1 ]] || { log_error "LXC $CTID wurde nicht rechtzeitig bereit."; return 1; }
+    pct push "$CTID" "$INSTALLER_TMP" /root/alexandrie-install.sh --perms 0700
     pct exec "$CTID" -- env \
         ALEXANDRIE_ASSET_BASE_URL="$REPO_RAW_URL" \
         ALEXANDRIE_RELEASE_VERSION="${REPO_RAW_URL##*/}" \
