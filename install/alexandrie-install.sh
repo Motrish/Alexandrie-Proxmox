@@ -234,12 +234,14 @@ main() {
     require_root
     fail_if_existing_installation
 
+    phase='base system bootstrap'
+    apt-get update
+    apt-get install --yes ca-certificates curl
     phase='network validation'
     check_network
     phase='base system update'
-    apt-get update
     apt-get full-upgrade --yes
-    apt-get install --yes ca-certificates curl gnupg jq openssl tar zstd lsb-release util-linux
+    apt-get install --yes gnupg jq openssl tar zstd lsb-release util-linux
     phase='Docker installation'
     install_docker
     phase='Alexandrie asset installation'
