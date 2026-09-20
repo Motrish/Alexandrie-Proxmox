@@ -11,3 +11,7 @@
 - `alexandrie-admin`, `alexandrie-update`, `alexandrie-backup`, `alexandrie-restore` und `alexandrie-health`;
 - atomare Konfigurationsänderungen, Locking und systemd-Startintegration;
 - GitHub-Action für Syntax-, ShellCheck-, shfmt-, Compose-, YAML- und Bats-Tests.
+
+### Fixed
+
+- Proxmox-Rootfs-Größe ohne `G`-Suffix an `pct create` übergeben; Directory- und LVM-Thin-Storages akzeptieren hier die Form `storage:size`.
