@@ -5,7 +5,7 @@ set -Eeuo pipefail
 #
 # Keep REPO_RAW_URL on the release tag. The host wrapper and every asset that
 # it downloads must come from the same tag; this prevents a mixed release.
-REPO_RAW_URL="${ALEXANDRIE_REPO_RAW_URL:-https://raw.githubusercontent.com/OWNER/REPOSITORY/v1.0.0}"
+REPO_RAW_URL="${ALEXANDRIE_REPO_RAW_URL:-https://raw.githubusercontent.com/Motrish/Alexandrie-Proxmox/v1.0.0}"
 
 TAGS='knowledge;wiki;docker'
 CTID=''
