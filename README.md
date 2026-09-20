@@ -6,7 +6,7 @@ Der prim√§re Zielpfad ist Proxmox VE 9 auf `amd64`. Proxmox VE 8 kann nur ausdr√
 
 ## Installation
 
-Vor dem ersten Release muss in `ct/alexandrie.sh` die Konstante `REPO_RAW_URL` auf das eigene GitHub-Repository und den Release-Tag angepasst werden. Danach wird der Installer vom Proxmox-Host als root gestartet:
+Der Installer wird vom Proxmox-Host als root direkt vom Release-Branch gestartet:
 
 ```bash
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/Motrish/Alexandrie-Proxmox/v1.0.0/ct/alexandrie.sh)"
