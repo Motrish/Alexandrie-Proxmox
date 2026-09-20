@@ -9,7 +9,7 @@ Der primäre Zielpfad ist Proxmox VE 9 auf `amd64`. Proxmox VE 8 kann nur ausdr�
 Vor dem ersten Release muss in `ct/alexandrie.sh` die Konstante `REPO_RAW_URL` auf das eigene GitHub-Repository und den Release-Tag angepasst werden. Danach wird der Installer vom Proxmox-Host als root gestartet:
 
 ```bash
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/<OWNER>/<REPOSITORY>/v1.0.0/ct/alexandrie.sh)"
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/Motrish/Alexandrie-Proxmox/v1.0.0/ct/alexandrie.sh)"
 ```
 
 Das Skript fragt CTID, Rootdir-Storage, Template-Storage, Bridge, Netzwerk, CPU, RAM, Swap und Diskgröße ab. Es erstellt niemals einen vorhandenen Container neu, stoppt ihn nicht und löscht ihn nicht.
@@ -31,7 +31,7 @@ Der Standard erzeugt:
 Beispiel für eine nicht-interaktive Installation:
 
 ```bash
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/<OWNER>/<REPOSITORY>/v1.0.0/ct/alexandrie.sh)" -- \
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/Motrish/Alexandrie-Proxmox/v1.0.0/ct/alexandrie.sh)" -- \
   --ctid 120 --hostname alexandrie --storage local-lvm \
   --template-storage local --bridge vmbr0 --ip dhcp \
   --non-interactive
