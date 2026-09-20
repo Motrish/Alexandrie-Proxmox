@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC2154
+set -Eeuo pipefail
+
+# shellcheck disable=SC1091
+source /usr/local/lib/alexandrie/lib.sh
+
+phase='initialization'
+temporary_directory=''
+restore_backend_state='false'
+restore_frontend_state='false'
+mysql_config_path=''
+
+on_error() {
+    log_error "Backup fehlgeschlagen (Phase: $phase, Zeile: $1)."
+    cleanup
+    exit 1
+}
+
+cleanup() {
+    if [[ -n $mysql_config_path ]]; then
+        docker compose exec -T mysql rm -f /tmp/.alexandrie-backup.cnf >/dev/null 2>&1 || true
+    fi
+    [[ $restore_backend_state == true ]] && compose start backend >/dev/null 2>&1 || true
+    [[ $restore_frontend_state == true ]] && compose start frontend >/dev/null 2>&1 || true
+    if [[ -n $temporary_directory && -d $temporary_directory ]]; then
+        rm -rf -- "$temporary_directory"
+    fi
+}
+trap 'on_error "$LINENO"' ERR
+trap cleanup EXIT
+
+mysql_prepare_config() {
+    local path=$1
+    mysql_config_path="$path"
+    cat > "$path" <<EOF
+[client]
+user=root
+password=${MYSQL_ROOT_PASSWORD}
+host=127.0.0.1
+EOF
+    chmod 600 "$path"
+    docker cp "$path" alexandrie-mysql:/tmp/.alexandrie-backup.cnf >/dev/null
+}
+
+prune_backups() {
+    local retention=${BACKUP_RETENTION:-7} count index
+    local -a backups=()
+    [[ $retention =~ ^[1-9][0-9]*$ ]] || retention=7
+    mapfile -t backups < <(find "$ALEXANDRIE_BACKUP_DIR" -mindepth 1 -maxdepth 1 -type d -name '20*' -printf '%f\n' | sort)
+    count=${#backups[@]}
+    if (( count > retention )); then
+        for (( index = 0; index < count - retention; index++ )); do
+            rm -rf -- "$ALEXANDRIE_BACKUP_DIR/${backups[index]}"
+        done
+    fi
+}
+
+main() {
+    local stamp final_directory temporary_root mysql_digest rustfs_digest backend_digest frontend_digest
+    require_root
+    require_stack_files
+    [[ ${ALEXANDRIE_LOCK_HELD:-0} == 1 ]] || ensure_lock
+    load_env
+    install -d -o root -g root -m 700 "$ALEXANDRIE_BACKUP_DIR"
+
+    stamp=$(date -u +%Y%m%dT%H%M%SZ)
+    final_directory="$ALEXANDRIE_BACKUP_DIR/$stamp"
+    [[ ! -e $final_directory ]] || die "Backupziel existiert bereits: $final_directory"
+    temporary_root=$(mktemp -d "$ALEXANDRIE_BACKUP_DIR/.tmp.${stamp}.XXXXXX")
+    temporary_directory=$temporary_root
+    install -d -o root -g root -m 700 "$temporary_root/rustfs-data"
+
+    if [[ $(docker inspect --format '{{.State.Running}}' alexandrie-backend 2>/dev/null || true) == true ]]; then
+        restore_backend_state='true'
+    fi
+    if [[ $(docker inspect --format '{{.State.Running}}' alexandrie-frontend 2>/dev/null || true) == true ]]; then
+        restore_frontend_state='true'
+    fi
+    if [[ $restore_backend_state == true || $restore_frontend_state == true ]]; then
+        phase='application quiesce'
+        compose stop backend frontend >/dev/null
+    fi
+
+    phase='MySQL dump'
+    mysql_prepare_config "$temporary_root/mysql.cnf"
+    docker compose exec -T mysql mysqldump \
+        --defaults-extra-file=/tmp/.alexandrie-backup.cnf \
+        --all-databases --routines --triggers --single-transaction --hex-blob \
+        > "$temporary_root/mysql-all.sql"
+    chmod 600 "$temporary_root/mysql-all.sql"
+
+    phase='RustFS archive'
+    docker cp alexandrie-rustfs:/data/. "$temporary_root/rustfs-data/"
+    tar -C "$temporary_root/rustfs-data" -cf "$temporary_root/rustfs-data.tar" .
+    chmod 600 "$temporary_root/rustfs-data.tar"
+    rm -rf -- "$temporary_root/rustfs-data"
+
+    phase='configuration archive'
+    install -o root -g root -m 600 "$ALEXANDRIE_ENV_FILE" "$temporary_root/.env"
+    install -o root -g root -m 600 "$ALEXANDRIE_COMPOSE_FILE" "$temporary_root/compose.yaml"
+    docker compose version > "$temporary_root/docker-compose-version.txt"
+    chmod 600 "$temporary_root/docker-compose-version.txt"
+    mysql_digest=$(container_digest alexandrie-mysql || true)
+    rustfs_digest=$(container_digest alexandrie-rustfs || true)
+    backend_digest=$(container_digest alexandrie-backend || true)
+    frontend_digest=$(container_digest alexandrie-frontend || true)
+    {
+        printf 'created_at_utc=%s\n' "$stamp"
+        printf 'alexandrie_installer_release=%s\n' "${ALEXANDRIE_INSTALLER_RELEASE:-unknown}"
+        printf 'mysql_image_digest=%s\n' "${mysql_digest:-unknown}"
+        printf 'rustfs_image_digest=%s\n' "${rustfs_digest:-unknown}"
+        printf 'backend_image_digest=%s\n' "${backend_digest:-unknown}"
+        printf 'frontend_image_digest=%s\n' "${frontend_digest:-unknown}"
+        printf 'docker_version=%s\n' "$(docker version --format '{{.Server.Version}}' 2>/dev/null || printf unknown)"
+        printf 'contents=mysql-all.sql,rustfs-data.tar,.env,compose.yaml\n'
+    } > "$temporary_root/manifest.txt"
+    chmod 600 "$temporary_root/manifest.txt"
+    (cd "$temporary_root" && find . -type f ! -name checksums.sha256 -print0 | sort -z | xargs -0 sha256sum > checksums.sha256)
+    chmod 600 "$temporary_root/checksums.sha256"
+
+    phase='atomic backup commit'
+    mv -f -- "$temporary_root" "$final_directory"
+    temporary_directory=''
+    log_info "Backup erfolgreich erstellt: $final_directory"
+    prune_backups
+}
+
+main "$@"

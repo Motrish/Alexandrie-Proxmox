@@ -1,0 +1,309 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC2154
+set -Eeuo pipefail
+
+readonly SCRIPT_NAME='alexandrie-config'
+readonly LIB_FILE='/usr/local/lib/alexandrie/lib.sh'
+
+# shellcheck disable=SC1091
+source "$LIB_FILE"
+
+phase='initialization'
+
+on_error() {
+    log_error "Konfiguration fehlgeschlagen (Phase: $phase, Zeile: $1)."
+    exit 1
+}
+trap 'on_error "$LINENO"' ERR
+
+usage() {
+    cat <<'EOF'
+Verwendung:
+  alexandrie-config                 Interaktiven Konfigurator starten
+  alexandrie-config --enforce-sso   Lokale Anmeldung deaktivieren
+  alexandrie-config --relax-sso     Lokale Anmeldung für Reparaturen einblenden
+EOF
+}
+
+prompt_value() {
+    local label=$1
+    local default_value=${2-}
+    local secret=${3:-false}
+    local value
+
+    if [[ ${ALEXANDRIE_NONINTERACTIVE:-0} == 1 ]]; then
+        [[ -n $default_value ]] || die "Nicht-interaktive Konfiguration benötigt: $label"
+        REPLY=$default_value
+        return
+    fi
+
+    if [[ $secret == true ]]; then
+        while :; do
+            if [[ -n $default_value ]]; then
+                read -r -s -p "$label [Enter = unverändert]: " value
+                printf '\n'
+                [[ -n $value ]] || value=$default_value
+            else
+                read -r -s -p "$label: " value
+                printf '\n'
+            fi
+            [[ -n $value ]] && break
+            log_warn 'Der Wert darf nicht leer sein.'
+        done
+    else
+        read -r -p "$label${default_value:+ [$default_value]}: " value
+        value=${value:-$default_value}
+    fi
+    REPLY=$value
+}
+
+prompt_required_url() {
+    local label=$1
+    local default_value=${2-}
+    local value
+
+    while :; do
+        prompt_value "$label" "$default_value"
+        value=$(normalise_public_url "$REPLY")
+        if validate_public_url "$value" || [[ ${ALEXANDRIE_ALLOW_HTTP:-0} == 1 && $value =~ ^https?://[^[:space:]/]+([:/][^[:space:]]*)?$ ]]; then
+            REPLY=$value
+            return
+        fi
+        log_warn 'Erwartet wird eine URL ohne abschließenden Slash; produktiv ausschließlich https://.'
+    done
+}
+
+discover_host() {
+    local value=${1#*://}
+    value=${value%%/*}
+    value=${value%%:*}
+    printf '%s' "$value"
+}
+
+install_ca_bundle() {
+    local source_file=${1-}
+    local bundle_tmp
+
+    [[ -s /etc/ssl/certs/ca-certificates.crt ]] || die 'Das System-CA-Bundle fehlt.'
+    install -d -o root -g root -m 755 "$ALEXANDRIE_CONFIG_DIR"
+    if [[ -n $source_file ]]; then
+        [[ -f $source_file ]] || die "CA-Datei nicht gefunden: $source_file"
+        install -o root -g root -m 644 "$source_file" /usr/local/share/ca-certificates/alexandrie-oidc.crt
+        update-ca-certificates >/dev/null
+    fi
+    bundle_tmp=$(mktemp "${ALEXANDRIE_CONFIG_DIR}/ca-bundle.XXXXXX")
+    cat /etc/ssl/certs/ca-certificates.crt > "$bundle_tmp"
+    install -o root -g root -m 644 "$bundle_tmp" "$ALEXANDRIE_CONFIG_DIR/oidc-ca-bundle.pem"
+    rm -f -- "$bundle_tmp"
+}
+
+validate_discovery() {
+    local url=$1
+    local ca_bundle=${2:-/etc/ssl/certs/ca-certificates.crt}
+    local discovery_tmp
+
+    discovery_tmp=$(mktemp)
+    if ! curl --fail --silent --show-error --location --connect-timeout 10 --max-time 30 \
+        --cacert "$ca_bundle" "$url" -o "$discovery_tmp" 2>/dev/null; then
+        rm -f -- "$discovery_tmp"
+        return 1
+    fi
+    if ! jq -e '
+        (.issuer | type == "string" and length > 0) and
+        (.authorization_endpoint | type == "string" and length > 0) and
+        (.token_endpoint | type == "string" and length > 0) and
+        (.userinfo_endpoint | type == "string" and length > 0)
+    ' "$discovery_tmp" >/dev/null; then
+        rm -f -- "$discovery_tmp"
+        return 1
+    fi
+    rm -f -- "$discovery_tmp"
+}
+
+apply_oidc_values() {
+    local frontend_url=$1
+    local api_url=$2
+    local cdn_url=$3
+    local cookie_domain=$4
+    local discovery_url=$5
+    local client_id=$6
+    local client_secret=$7
+    local provider_name=$8
+    local mode=$9
+    local ca_source=${10-}
+    local -a updates
+
+    backup_env_file
+    install_ca_bundle "$ca_source"
+
+    updates=(
+        FRONTEND_URL "$frontend_url"
+        API_URL "$api_url"
+        CDN_URL "$cdn_url"
+        MINIO_PUBLIC_URL "$cdn_url"
+        COOKIE_DOMAIN "$cookie_domain"
+        OIDC_1_CONFIG_URL "$discovery_url"
+        OIDC_1_CLIENT_ID "$client_id"
+        OIDC_1_CLIENT_SECRET "$client_secret"
+        OIDC_1_PROVIDER_NAME "$provider_name"
+        OIDC_CA_SOURCE "$ca_source"
+        CONFIG_DISABLE_SIGNUP false
+        CONFIG_DISABLE_LANDING false
+        ALLOW_UNSECURE false
+        MINIO_SECURE false
+    )
+
+    if [[ $mode == strict ]]; then
+        updates+=(
+            CONFIG_DISABLE_NATIVE_LOGIN true
+            CONFIG_HIDE_NATIVE_LOGIN true
+            CONFIG_HIDE_NATIVE_LOGIN_FORM true
+            CONFIG_OIDC_PROVIDER_AUTO_REDIRECT "$provider_name"
+        )
+    else
+        updates+=(
+            CONFIG_DISABLE_NATIVE_LOGIN false
+            CONFIG_HIDE_NATIVE_LOGIN false
+            CONFIG_HIDE_NATIVE_LOGIN_FORM false
+            CONFIG_OIDC_PROVIDER_AUTO_REDIRECT ''
+        )
+    fi
+
+    atomic_update "${updates[@]}"
+
+    if is_stack_running; then
+        phase='application restart'
+        restart_application
+    fi
+}
+
+atomic_update() {
+    local candidate key value
+    candidate=$(mktemp "${ALEXANDRIE_ENV_FILE}.candidate.XXXXXX")
+    install -o root -g root -m 600 "$ALEXANDRIE_ENV_FILE" "$candidate"
+    while [[ $# -gt 0 ]]; do
+        key=$1
+        value=$2
+        set_env_value "$key" "$value" "$candidate"
+        shift 2
+    done
+    if ! (ALEXANDRIE_ENV_FILE="$candidate" compose_config_check); then
+        rm -f -- "$candidate"
+        die 'Die neue Konfiguration ist in Compose nicht gültig; die vorherige Konfiguration blieb aktiv.'
+    fi
+    mv -f -- "$candidate" "$ALEXANDRIE_ENV_FILE"
+    chmod 600 "$ALEXANDRIE_ENV_FILE"
+}
+
+enforce_sso() {
+    load_env
+    [[ -n ${OIDC_1_CONFIG_URL:-} && -n ${OIDC_1_CLIENT_ID:-} && -n ${OIDC_1_CLIENT_SECRET:-} && -n ${OIDC_1_PROVIDER_NAME:-} ]] \
+        || die 'OIDC ist unvollständig konfiguriert.'
+    phase='OIDC discovery validation'
+    validate_discovery "$OIDC_1_CONFIG_URL" /etc/alexandrie/oidc-ca-bundle.pem \
+        || die 'Die OIDC-Discovery konnte nicht validiert werden.'
+    backup_env_file
+    atomic_update \
+        CONFIG_DISABLE_NATIVE_LOGIN true \
+        CONFIG_HIDE_NATIVE_LOGIN true \
+        CONFIG_HIDE_NATIVE_LOGIN_FORM true \
+        CONFIG_OIDC_PROVIDER_AUTO_REDIRECT "$OIDC_1_PROVIDER_NAME"
+    if is_stack_running; then restart_application; fi
+    log_info 'SSO-Modus strict ist aktiv.'
+}
+
+relax_sso() {
+    load_env
+    backup_env_file
+    atomic_update \
+        CONFIG_DISABLE_NATIVE_LOGIN false \
+        CONFIG_HIDE_NATIVE_LOGIN false \
+        CONFIG_HIDE_NATIVE_LOGIN_FORM false \
+        CONFIG_OIDC_PROVIDER_AUTO_REDIRECT ''
+    if is_stack_running; then restart_application; fi
+    log_info 'Lokale Anmeldung ist wieder eingeblendet; OIDC bleibt konfiguriert.'
+}
+
+configure_interactively() {
+    local frontend_url api_url cdn_url cookie_domain discovery_url client_id client_secret provider_name mode ca_source
+
+    load_env
+    phase='public URL configuration'
+    prompt_required_url 'Öffentliche Frontend-URL' "${FRONTEND_URL:-https://alexandrie.example.org}"
+    frontend_url=$REPLY
+    prompt_required_url 'Öffentliche API-URL' "${API_URL:-https://alexandrie-api.example.org}"
+    api_url=$REPLY
+    prompt_required_url 'Öffentliche CDN-URL' "${CDN_URL:-https://alexandrie-cdn.example.org}"
+    cdn_url=$REPLY
+
+    cookie_domain=${COOKIE_DOMAIN:-}
+    if [[ -z $cookie_domain ]]; then
+        cookie_domain=$(discover_host "$frontend_url")
+        cookie_domain=${cookie_domain#*.}
+    fi
+    while :; do
+        prompt_value 'Gemeinsame Cookie-Domain ohne Schema/Port' "$cookie_domain"
+        cookie_domain=$REPLY
+        validate_cookie_domain "$cookie_domain" && break
+        log_warn 'Ungültige Cookie-Domain. Beispiel: example.org'
+    done
+
+    phase='OIDC configuration'
+    prompt_value 'Authentik-Discovery-URL' "${OIDC_1_CONFIG_URL:-https://auth.example.org/application/o/alexandrie/.well-known/openid-configuration}"
+    discovery_url=$(normalise_public_url "$REPLY")
+    if [[ ${ALEXANDRIE_ALLOW_HTTP:-0} != 1 && $discovery_url != https://* ]]; then
+        die 'Die OIDC-Discovery muss HTTPS verwenden.'
+    fi
+    [[ $discovery_url == */.well-known/openid-configuration ]] || log_warn 'Die URL endet nicht auf /.well-known/openid-configuration; sie wird trotzdem geprüft.'
+
+    ca_source=${OIDC_CA_SOURCE:-}
+    prompt_value 'Optionaler CA-Dateipfad (leer = System-CA verwenden)' "$ca_source"
+    ca_source=$REPLY
+    if [[ -n $ca_source ]]; then
+        [[ -f $ca_source ]] || die "CA-Datei nicht gefunden: $ca_source"
+    fi
+    install_ca_bundle "$ca_source"
+    validate_discovery "$discovery_url" /etc/alexandrie/oidc-ca-bundle.pem \
+        || die 'OIDC-Discovery fehlgeschlagen. Prüfe URL, DNS, Zertifikat und Netzwerkzugriff.'
+
+    printf '\nExakte Authentik-Redirect-URI:\n  %s/login/oidc/callback\n\n' "$frontend_url"
+    prompt_value 'OIDC Client-ID' "${OIDC_1_CLIENT_ID:-}"
+    client_id=$REPLY
+    prompt_value 'OIDC Client-Secret' "${OIDC_1_CLIENT_SECRET:-}" true
+    client_secret=$REPLY
+    prompt_value 'Providername' "${OIDC_1_PROVIDER_NAME:-Authentik}"
+    provider_name=$REPLY
+    [[ -n $provider_name ]] || die 'Der Providername darf nicht leer sein.'
+
+    mode=${CONFIG_OIDC_MODE:-staged}
+    if [[ ${ALEXANDRIE_NONINTERACTIVE:-0} != 1 ]]; then
+        while :; do
+            prompt_value 'SSO-Modus (staged/strict)' "$mode"
+            mode=${REPLY,,}
+            [[ $mode == staged || $mode == strict ]] && break
+            log_warn 'Erlaubt sind nur staged oder strict.'
+        done
+    fi
+    [[ -n $client_id && -n $client_secret ]] || die 'OIDC Client-ID und Client-Secret dürfen nicht leer sein.'
+    [[ $mode == staged || $mode == strict ]] || die 'SSO-Modus muss staged oder strict sein.'
+
+    phase='atomic configuration update'
+    apply_oidc_values "$frontend_url" "$api_url" "$cdn_url" "$cookie_domain" \
+        "$discovery_url" "$client_id" "$client_secret" "$provider_name" "$mode" "$ca_source"
+
+    log_info "Konfiguration gespeichert. OIDC-Modus: $mode"
+    log_info "Redirect-URI: $frontend_url/login/oidc/callback"
+}
+
+main() {
+    require_root
+    case ${1:-} in
+        '') configure_interactively ;;
+        --enforce-sso) enforce_sso ;;
+        --relax-sso) relax_sso ;;
+        -h|--help) usage ;;
+        *) usage >&2; exit 2 ;;
+    esac
+}
+
+main "$@"

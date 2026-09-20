@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC2154
+set -Eeuo pipefail
+
+# shellcheck disable=SC1091
+source /usr/local/lib/alexandrie/lib.sh
+
+quiet='false'
+verbose='false'
+failures=0
+
+usage() {
+    cat <<'EOF'
+Verwendung:
+  alexandrie-health
+  alexandrie-health --verbose
+  alexandrie-health --quiet
+EOF
+}
+
+result() {
+    local state=$1 label=$2 details=${3-}
+    if [[ $quiet != true ]]; then
+        printf '%-28s %-8s %s\n' "$label" "$state" "$details"
+    fi
+    [[ $state == OK || $state == INFO ]] || failures=$((failures + 1))
+}
+
+http_status() {
+    local url=$1
+    curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+        --connect-timeout 4 --max-time 10 "$url" 2>/dev/null || printf '000'
+}
+
+check_oidc() {
+    local temporary_file status
+    [[ -n ${OIDC_1_CONFIG_URL:-} ]] || { result INFO 'OIDC Discovery' 'nicht konfiguriert'; return 0; }
+    temporary_file=$(mktemp)
+    if ! curl --fail --silent --show-error --location --connect-timeout 10 --max-time 20 \
+        --cacert /etc/alexandrie/oidc-ca-bundle.pem "$OIDC_1_CONFIG_URL" -o "$temporary_file" 2>/dev/null; then
+        rm -f -- "$temporary_file"
+        result FAIL 'OIDC Discovery' 'nicht erreichbar'
+        return 0
+    fi
+    if jq -e '
+        (.issuer | type == "string" and length > 0) and
+        (.authorization_endpoint | type == "string" and length > 0) and
+        (.token_endpoint | type == "string" and length > 0) and
+        (.userinfo_endpoint | type == "string" and length > 0)
+    ' "$temporary_file" >/dev/null; then
+        status=$(jq -r '.issuer' "$temporary_file")
+        result OK 'OIDC Discovery' "$status"
+    else
+        result FAIL 'OIDC Discovery' 'Pflichtfelder fehlen'
+    fi
+    rm -f -- "$temporary_file"
+}
+
+check_containers() {
+    local service container state health
+    for service in mysql rustfs backend frontend; do
+        container="alexandrie-$service"
+        state=$(docker inspect --format '{{.State.Status}}' "$container" 2>/dev/null || printf 'missing')
+        health=$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' \
+            "$container" 2>/dev/null || printf 'missing')
+        if [[ $state == running && ( $health == healthy || $health == none ) ]]; then
+            result OK "Container $service" "state=$state health=$health"
+        else
+            result FAIL "Container $service" "state=$state health=$health"
+        fi
+    done
+}
+
+check_backup() {
+    local last
+    last=$(find "$ALEXANDRIE_BACKUP_DIR" -mindepth 1 -maxdepth 1 -type d -name '20*' -printf '%f\n' 2>/dev/null | sort | tail -n 1 || true)
+    if [[ -n $last ]]; then
+        result OK 'Letztes Backup' "$ALEXANDRIE_BACKUP_DIR/$last"
+    else
+        result FAIL 'Letztes Backup' 'kein Backup vorhanden'
+    fi
+}
+
+show_logs() {
+    printf '\n--- letzte Logs, Secrets maskiert ---\n'
+    compose logs --tail=80 2>&1 | mask_stream
+}
+
+main() {
+    local status frontend_status api_status rustfs_status disk_usage
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --quiet) quiet='true' ;;
+            --verbose) verbose='true' ;;
+            -h|--help) usage; return 0 ;;
+            *) usage >&2; return 2 ;;
+        esac
+        shift
+    done
+
+    require_root
+    require_stack_files
+    load_env
+    if [[ $quiet != true ]]; then
+        printf 'Alexandrie Health (%s)\n' "$(date -Is)"
+        printf '%-28s %-8s %s\n' 'Prüfung' 'Status' 'Details'
+    fi
+
+    if systemctl is-enabled --quiet alexandrie.service 2>/dev/null && systemctl is-active --quiet alexandrie.service 2>/dev/null; then
+        [[ $quiet == true ]] || result OK 'systemd Alexandrie' 'enabled/active'
+    else
+        [[ $quiet == true ]] || result FAIL 'systemd Alexandrie' 'nicht enabled/active'
+        failures=$((failures + 1))
+    fi
+    if docker info >/dev/null 2>&1; then
+        [[ $quiet == true ]] || result OK 'Docker' 'daemon erreichbar'
+    else
+        [[ $quiet == true ]] || result FAIL 'Docker' 'daemon nicht erreichbar'
+        failures=$((failures + 1))
+    fi
+
+    if [[ $quiet == true ]]; then
+        compose ps >/dev/null 2>&1 || failures=$((failures + 1))
+    else
+        compose ps
+    fi
+    check_containers
+
+    frontend_status=$(http_status 'http://127.0.0.1:8200/')
+    api_status=$(http_status 'http://127.0.0.1:8201/api/auth/oidc/providers')
+    rustfs_status=$(http_status 'http://127.0.0.1:9000/health/ready')
+    [[ $frontend_status =~ ^[23][0-9][0-9] ]] && result OK 'Frontend HTTP' "$frontend_status" || result FAIL 'Frontend HTTP' "$frontend_status"
+    [[ $api_status =~ ^[23][0-9][0-9] ]] && result OK 'Backend HTTP' "$api_status" || result FAIL 'Backend HTTP' "$api_status"
+    [[ $rustfs_status =~ ^[23][0-9][0-9] ]] && result OK 'RustFS HTTP' "$rustfs_status" || result FAIL 'RustFS HTTP' "$rustfs_status"
+    check_oidc
+
+    disk_usage=$(df -h "$ALEXANDRIE_APP_DIR" | awk 'NR == 2 { print $5 " belegt, frei " $4 }')
+    result INFO 'Freier Speicher' "$disk_usage"
+    check_backup
+
+    if [[ $verbose == true ]]; then show_logs; fi
+    (( failures == 0 ))
+}
+
+main "$@"

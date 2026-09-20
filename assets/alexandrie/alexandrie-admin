@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC2154
+set -Eeuo pipefail
+
+# shellcheck disable=SC1091
+source /usr/local/lib/alexandrie/lib.sh
+
+mysql_config_path=''
+
+cleanup_mysql_config() {
+    if [[ -n $mysql_config_path ]]; then
+        docker compose exec -T mysql rm -f /tmp/.alexandrie-admin.cnf >/dev/null 2>&1 || true
+        rm -f -- "$mysql_config_path"
+        mysql_config_path=''
+    fi
+}
+trap cleanup_mysql_config EXIT
+
+usage() {
+    cat <<'EOF'
+Verwendung:
+  alexandrie-admin list
+  alexandrie-admin add user@example.org
+  alexandrie-admin remove user@example.org
+EOF
+}
+
+mysql_prepare_config() {
+    local path=$1
+    mysql_config_path=$path
+    cat > "$path" <<EOF
+[client]
+user=root
+password=${MYSQL_ROOT_PASSWORD}
+host=127.0.0.1
+EOF
+    chmod 600 "$path"
+    docker cp "$path" alexandrie-mysql:/tmp/.alexandrie-admin.cnf >/dev/null
+}
+
+mysql_query() {
+    local query=$1
+    local temporary_config
+    temporary_config=$(mktemp)
+    mysql_prepare_config "$temporary_config"
+    printf '%s\n' "$query" | docker compose exec -T mysql mysql \
+        --defaults-extra-file=/tmp/.alexandrie-admin.cnf --batch --skip-column-names --raw
+}
+
+csv_contains() {
+    local needle=$1 item
+    local -a values=()
+    IFS=',' read -r -a values <<< "${ADMIN_ACCOUNTS:-}"
+    for item in "${values[@]}"; do
+        [[ $item == "$needle" ]] && return 0
+    done
+    return 1
+}
+
+csv_without() {
+    local needle=$1 item
+    local -a values=() result=()
+    IFS=',' read -r -a values <<< "${ADMIN_ACCOUNTS:-}"
+    for item in "${values[@]}"; do
+        [[ -z $item || $item == "$needle" ]] || result+=("$item")
+    done
+    local IFS=,
+    printf '%s' "${result[*]-}"
+}
+
+restart_backend_after_admin_change() {
+    compose_config_check
+    compose up -d --force-recreate backend >/dev/null
+}
+
+list_users() {
+    local query
+    query='SELECT id, email, username, role FROM users ORDER BY email;'
+    printf 'ID\tE-Mail\tBenutzername\tRolle\n'
+    mysql_query "$query" | awk -F '\t' 'BEGIN { OFS="\t" } { print $1, $2, $3, ($4 == 2 ? "Administrator" : "Benutzer") }'
+    printf '\nADMIN_ACCOUNTS: %s\n' "${ADMIN_ACCOUNTS:-<leer>}"
+}
+
+change_admin() {
+    local operation=$1 email escaped_email id new_admin_accounts
+    validate_email "$email" || die 'Bitte eine gültige E-Mail-Adresse angeben.'
+    escaped_email=$(sql_escape_string "$email")
+    id=$(mysql_query "SELECT id FROM users WHERE LOWER(email)=LOWER('$escaped_email');" | sed '/^[[:space:]]*$/d')
+    [[ -n $id ]] || die "Kein Alexandrie-Benutzer mit dieser E-Mail-Adresse gefunden: $email"
+    [[ $(printf '%s\n' "$id" | wc -l) -eq 1 ]] || die 'Die E-Mail-Adresse ist nicht eindeutig; Änderung abgebrochen.'
+    [[ $id =~ ^[0-9]+$ ]] || die 'Die Datenbank-ID hat ein unerwartetes Format.'
+
+    case $operation in
+        add)
+            if csv_contains "$id"; then
+                log_info 'Der Benutzer ist bereits in ADMIN_ACCOUNTS.'
+                return 0
+            fi
+            if [[ -n ${ADMIN_ACCOUNTS:-} ]]; then
+                new_admin_accounts="${ADMIN_ACCOUNTS},${id}"
+            else
+                new_admin_accounts=$id
+            fi
+            ;;
+        remove)
+            csv_contains "$id" || {
+                log_info 'Der Benutzer ist nicht in ADMIN_ACCOUNTS.'
+                return 0
+            }
+            new_admin_accounts=$(csv_without "$id")
+            ;;
+        *) die "Unbekannte Operation: $operation" ;;
+    esac
+
+    backup_env_file
+    set_env_value ADMIN_ACCOUNTS "$new_admin_accounts"
+    restart_backend_after_admin_change
+    log_info "ADMIN_ACCOUNTS wurde für $email aktualisiert."
+    log_info 'Die Administratorrolle wird beim Backend-Neustart auf den internen Benutzer angewendet.'
+}
+
+main() {
+    require_root
+    require_stack_files
+    ensure_lock
+    load_env
+    case ${1:-} in
+        list) list_users ;;
+        add|remove)
+            [[ $# -eq 2 ]] || { usage >&2; exit 2; }
+            change_admin "$1" "$2"
+            ;;
+        -h|--help) usage ;;
+        *) usage >&2; exit 2 ;;
+    esac
+}
+
+main "$@"

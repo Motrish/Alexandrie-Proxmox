@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC2154
+set -Eeuo pipefail
+
+# shellcheck disable=SC1091
+source /usr/local/lib/alexandrie/lib.sh
+
+phase='initialization'
+backup_directory=''
+mysql_config_path=''
+safety_backup=''
+
+on_error() {
+    log_error "Restore fehlgeschlagen (Phase: $phase, Zeile: $1)."
+    log_error "Das Sicherheitsbackup vor dem Restore bleibt erhalten: ${safety_backup:-siehe $ALEXANDRIE_BACKUP_DIR}"
+    log_error 'Prüfe zuerst alexandrie-health und starte bei Bedarf den Stack mit docker compose up -d.'
+    exit 1
+}
+trap 'on_error "$LINENO"' ERR
+
+usage() {
+    cat <<'EOF'
+Verwendung:
+  alexandrie-restore /opt/alexandrie/backups/20260101T120000Z
+
+Der Restore verlangt zusätzlich die Eingabe RESTORE.
+EOF
+}
+
+confirm_restore() {
+    local answer
+    [[ ${ALEXANDRIE_NONINTERACTIVE:-0} == 1 ]] && return 0
+    read -r -p "Zum Fortfahren exakt RESTORE eingeben: " answer
+    [[ $answer == RESTORE ]] || die 'Restore abgebrochen.'
+}
+
+wait_for_service_health() {
+    local service=$1 deadline status
+    deadline=$((SECONDS + 120))
+    while (( SECONDS < deadline )); do
+        status=$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' \
+            "alexandrie-$service" 2>/dev/null || true)
+        [[ $status == healthy || $status == running ]] && return 0
+        [[ $status == unhealthy || $status == exited || $status == dead ]] && return 1
+        sleep 3
+    done
+    return 1
+}
+
+mysql_prepare_config() {
+    local path=$1
+    mysql_config_path=$path
+    cat > "$path" <<EOF
+[client]
+user=root
+password=${MYSQL_ROOT_PASSWORD}
+host=127.0.0.1
+EOF
+    chmod 600 "$path"
+    docker cp "$path" alexandrie-mysql:/tmp/.alexandrie-restore.cnf >/dev/null
+}
+
+restore_rustfs_volume() {
+    local volume_mountpoint
+    volume_mountpoint=$(docker volume inspect --format '{{.Mountpoint}}' alexandrie_rustfs_data 2>/dev/null || true)
+    [[ -n $volume_mountpoint && -d $volume_mountpoint ]] || die 'RustFS-Docker-Volume konnte nicht aufgelöst werden.'
+    find "$volume_mountpoint" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+    tar -C "$volume_mountpoint" -xf "$backup_directory/rustfs-data.tar"
+}
+
+main() {
+    local temp_env temp_compose
+    require_root
+    [[ $# -eq 1 ]] || { usage >&2; exit 2; }
+    backup_directory=$1
+    [[ -d $backup_directory ]] || die "Backup-Verzeichnis nicht gefunden: $backup_directory"
+    [[ -f $backup_directory/manifest.txt && -f $backup_directory/checksums.sha256 ]] || die 'Backup-Manifest oder Prüfsummen fehlen.'
+    (cd "$backup_directory" && sha256sum --strict --check checksums.sha256 >/dev/null) || die 'Backup-Prüfsummen sind ungültig.'
+    [[ -f $backup_directory/mysql-all.sql && -f $backup_directory/rustfs-data.tar && -f $backup_directory/.env && -f $backup_directory/compose.yaml ]] \
+        || die 'Backup enthält nicht alle erforderlichen Dateien.'
+
+    ensure_lock
+    load_env
+    confirm_restore
+
+    phase='safety backup'
+    ALEXANDRIE_LOCK_HELD=1 alexandrie-backup
+    safety_backup=$(find "$ALEXANDRIE_BACKUP_DIR" -mindepth 1 -maxdepth 1 -type d -name '20*' -printf '%p\n' | sort | tail -n 1)
+
+    temp_env=$(mktemp "${ALEXANDRIE_ENV_FILE}.restore.XXXXXX")
+    temp_compose=$(mktemp "${ALEXANDRIE_COMPOSE_FILE}.restore.XXXXXX")
+    install -m 600 "$backup_directory/.env" "$temp_env"
+    install -m 600 "$backup_directory/compose.yaml" "$temp_compose"
+    chown root:root "$temp_env" "$temp_compose"
+    mv -f -- "$temp_env" "$ALEXANDRIE_ENV_FILE"
+    mv -f -- "$temp_compose" "$ALEXANDRIE_COMPOSE_FILE"
+
+    phase='restore configuration validation'
+    load_env
+    compose_config_check
+    phase='controlled stack stop'
+    compose down
+    phase='database and object storage startup'
+    compose up -d mysql rustfs
+    wait_for_service_health mysql
+    wait_for_service_health rustfs
+
+    phase='MySQL restore'
+    mysql_prepare_config "$(mktemp)"
+    compose exec -T mysql mysql --defaults-extra-file=/tmp/.alexandrie-restore.cnf < "$backup_directory/mysql-all.sql"
+    compose exec -T mysql rm -f /tmp/.alexandrie-restore.cnf >/dev/null
+    mysql_config_path=''
+
+    phase='RustFS restore'
+    compose stop rustfs >/dev/null
+    restore_rustfs_volume
+
+    phase='full stack startup'
+    compose up -d --remove-orphans
+    phase='post-restore health check'
+    alexandrie-health --quiet
+    log_info 'Restore erfolgreich abgeschlossen.'
+}
+
+main "$@"

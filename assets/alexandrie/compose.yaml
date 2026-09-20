@@ -1,0 +1,130 @@
+services:
+  mysql:
+    image: "${MYSQL_IMAGE}"
+    container_name: alexandrie-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: "${MYSQL_ROOT_PASSWORD}"
+      MYSQL_DATABASE: "${MYSQL_DATABASE}"
+      MYSQL_USER: "${MYSQL_USER}"
+      MYSQL_PASSWORD: "${MYSQL_PASSWORD}"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    networks:
+      - alexandrie-network
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          mysql -u"$${MYSQL_USER}" -p"$${MYSQL_PASSWORD}"
+          -e 'SELECT 1' "$${MYSQL_DATABASE}"
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  rustfs:
+    image: "${RUSTFS_IMAGE}"
+    container_name: alexandrie-rustfs
+    restart: unless-stopped
+    environment:
+      RUSTFS_ACCESS_KEY: "${RUSTFS_ACCESS_KEY}"
+      RUSTFS_SECRET_KEY: "${RUSTFS_SECRET_KEY}"
+      RUSTFS_CONSOLE_ENABLE: "${RUSTFS_CONSOLE_ENABLE}"
+      RUSTFS_LOG_LEVEL: "${RUSTFS_LOG_LEVEL}"
+    ports:
+      - "${RUSTFS_BIND}:9000"
+    volumes:
+      - rustfs_data:/data
+      - rustfs_logs:/logs
+    networks:
+      - alexandrie-network
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 9000 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 20s
+
+  backend:
+    image: "${ALEXANDRIE_BACKEND_IMAGE}"
+    container_name: alexandrie-backend
+    restart: unless-stopped
+    environment:
+      BACKEND_PORT: "8201"
+      GIN_MODE: "release"
+      JWT_SECRET: "${JWT_SECRET}"
+      COOKIE_DOMAIN: "${COOKIE_DOMAIN}"
+      FRONTEND_URL: "${FRONTEND_URL}"
+      ALLOW_UNSECURE: "${ALLOW_UNSECURE}"
+      CONFIG_DISABLE_SIGNUP: "${CONFIG_DISABLE_SIGNUP}"
+      CONFIG_DISABLE_NATIVE_LOGIN: "${CONFIG_DISABLE_NATIVE_LOGIN}"
+      CONFIG_HIDE_NATIVE_LOGIN: "${CONFIG_HIDE_NATIVE_LOGIN}"
+      CONFIG_HIDE_NATIVE_LOGIN_FORM: "${CONFIG_HIDE_NATIVE_LOGIN_FORM}"
+      CONFIG_OIDC_PROVIDER_AUTO_REDIRECT: "${CONFIG_OIDC_PROVIDER_AUTO_REDIRECT}"
+      ADMIN_ACCOUNTS: "${ADMIN_ACCOUNTS}"
+      DATABASE_HOST: "mysql"
+      DATABASE_PORT: "3306"
+      DATABASE_NAME: "${MYSQL_DATABASE}"
+      DATABASE_USER: "${MYSQL_USER}"
+      DATABASE_PASSWORD: "${MYSQL_PASSWORD}"
+      MINIO_ENDPOINT: "rustfs:9000"
+      MINIO_PUBLIC_URL: "${MINIO_PUBLIC_URL}"
+      MINIO_SECURE: "${MINIO_SECURE}"
+      MINIO_INSECURE_TLS: "${MINIO_INSECURE_TLS}"
+      MINIO_ACCESSKEY: "${RUSTFS_ACCESS_KEY}"
+      MINIO_SECRETKEY: "${RUSTFS_SECRET_KEY}"
+      MINIO_BUCKET: "${MINIO_BUCKET}"
+      SMTP_HOST: "${SMTP_HOST}"
+      SMTP_MAIL: "${SMTP_MAIL}"
+      SMTP_MAIL_FROM: "${SMTP_MAIL_FROM}"
+      SMTP_PASSWORD: "${SMTP_PASSWORD}"
+      OIDC_1_CONFIG_URL: "${OIDC_1_CONFIG_URL}"
+      OIDC_1_CLIENT_ID: "${OIDC_1_CLIENT_ID}"
+      OIDC_1_CLIENT_SECRET: "${OIDC_1_CLIENT_SECRET}"
+      OIDC_1_PROVIDER_NAME: "${OIDC_1_PROVIDER_NAME}"
+      SSL_CERT_FILE: "/etc/ssl/certs/alexandrie-ca-bundle.pem"
+      CURL_CA_BUNDLE: "/etc/ssl/certs/alexandrie-ca-bundle.pem"
+    ports:
+      - "${BACKEND_BIND}:8201"
+    volumes:
+      - /etc/alexandrie/oidc-ca-bundle.pem:/etc/ssl/certs/alexandrie-ca-bundle.pem:ro
+    depends_on:
+      mysql:
+        condition: service_healthy
+      rustfs:
+        condition: service_healthy
+    networks:
+      - alexandrie-network
+
+  frontend:
+    image: "${ALEXANDRIE_FRONTEND_IMAGE}"
+    container_name: alexandrie-frontend
+    restart: unless-stopped
+    environment:
+      PORT: "8200"
+      NUXT_PUBLIC_BASE_API: "${API_URL}"
+      NUXT_PUBLIC_BASE_CDN: "${CDN_URL}"
+      NUXT_PUBLIC_CDN_ENDPOINT: "${CDN_ENDPOINT}"
+      NUXT_PUBLIC_BASE_URL: "${FRONTEND_URL}"
+      NUXT_PUBLIC_CONFIG_DISABLE_SIGNUP_PAGE: "${CONFIG_DISABLE_SIGNUP}"
+      NUXT_PUBLIC_CONFIG_DISABLE_LANDING_PAGE: "${CONFIG_DISABLE_LANDING}"
+      NUXT_PUBLIC_CONFIG_DISABLE_NATIVE_LOGIN: "${CONFIG_DISABLE_NATIVE_LOGIN}"
+      NUXT_PUBLIC_CONFIG_HIDE_NATIVE_LOGIN: "${CONFIG_HIDE_NATIVE_LOGIN}"
+      NUXT_PUBLIC_CONFIG_HIDE_NATIVE_LOGIN_FORM: "${CONFIG_HIDE_NATIVE_LOGIN_FORM}"
+      NUXT_PUBLIC_CONFIG_OIDC_PROVIDER_AUTO_REDIRECT: "${CONFIG_OIDC_PROVIDER_AUTO_REDIRECT}"
+    ports:
+      - "${FRONTEND_BIND}:8200"
+    depends_on:
+      - backend
+    networks:
+      - alexandrie-network
+
+networks:
+  alexandrie-network:
+    driver: bridge
+
+volumes:
+  mysql_data:
+  rustfs_data:
+  rustfs_logs:

@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC2154
+set -Eeuo pipefail
+
+# shellcheck disable=SC1091
+source /usr/local/lib/alexandrie/lib.sh
+
+phase='initialization'
+on_error() {
+    log_error "Update fehlgeschlagen (Phase: $phase, Zeile: $1)."
+    log_warn 'Der Stack bleibt zur Diagnose erhalten. Prüfe alexandrie-health und die Backup-Liste.'
+    exit 1
+}
+trap 'on_error "$LINENO"' ERR
+
+image_snapshot() {
+    local name digest
+    for name in alexandrie-mysql alexandrie-rustfs alexandrie-backend alexandrie-frontend; do
+        digest=$(container_digest "$name" || true)
+        printf '%s %s\n' "$name" "${digest:-unbekannt}"
+    done
+}
+
+free_space_check() {
+    local percent
+    percent=$(df -P -k "$ALEXANDRIE_APP_DIR" | awk 'NR == 2 { gsub(/%/, "", $5); print $5 }')
+    [[ $percent =~ ^[0-9]+$ ]] || die 'Freier Speicher konnte nicht geprüft werden.'
+    (( percent < 90 )) || die "Zu wenig freier Speicher: ${percent}% belegt."
+}
+
+main() {
+    require_root
+    require_stack_files
+    ensure_lock
+    load_env
+
+    phase='pre-update checks'
+    free_space_check
+    compose ps
+    printf '\nImages vor dem Update:\n'
+    image_snapshot
+
+    phase='pre-update backup'
+    ALEXANDRIE_LOCK_HELD=1 alexandrie-backup
+
+    phase='image download'
+    compose pull
+    phase='stack restart'
+    compose up -d --remove-orphans
+
+    phase='post-update health check'
+    if ! alexandrie-health --quiet; then
+        log_error 'Gesundheitsprüfung nach dem Update fehlgeschlagen.'
+        exit 1
+    fi
+    printf '\nImages nach dem Update:\n'
+    image_snapshot
+    log_info 'Update erfolgreich abgeschlossen.'
+    log_warn 'Nicht verwendete Docker-Images wurden nicht global bereinigt, um andere Stacks im LXC nicht zu beeinflussen.'
+}
+
+main "$@"
